@@ -1,4 +1,4 @@
-from transformers import PretrainedConfig
+from transformers import Optional, PretrainedConfig
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -73,6 +73,7 @@ class MiniMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
 
 class RMSNorm(nn.Module):
 
@@ -87,3 +88,59 @@ class RMSNorm(nn.Module):
 
     def forward(self,x):
         return self.weight * self._norm(x.float()).type_as(x)
+
+def precompute_freqs_cis(dim:int,end:int=int(32*1024),rope_base:float=1e6,rope_scaling:Optional[dict]=None):
+    freqs=1.0/(rope_base**(torch.arange(0,dim,2)[:dim//2].float()/dim))
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
+        )
+        if end / orig_max > 1.0:
+            # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            freqs = freqs * (1 - ramp + ramp / factor)
+
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    return freqs_cos, freqs_sin
+
+def apply_rotary_pos_emb(q,k,cos,sin,position_ids=None,unsqueeze_dim=1):
+    def rotate_half(x:torch.Tensor):
+        x1=x[..., :x.shape[-1]//2]
+        x2=x[..., x.shape[-1]//2:]
+        return torch.stack((-x2,x1),dim=-1).flatten(-2)
+    
+def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
+        bs,slen,n_key_value_heads,head_dim=x.shape
+        if n_rep==1:
+            return x
+        
+        return x[:, :, :, None, :].expand(bs,slen,n_key_value_heads,n_rep,head_dim).reshape(bs,slen,n_key_value_heads*n_rep,head_dim)
+
+class Attention(nn.Module):
+    def __init__(self,args:MiniMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads=args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+
+        assert args.num_attention_heads%self.num_key_value_heads==0, "num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads=args.num_attention_heads
+        self.n_local_kv_heads=self.num_key_value_heads
+        self.n_rep=self.n_local_heads//self.n_local_kv_heads
+        self.head_dim=args.hidden_size//args.num_attention_heads
+
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)     # Query投影
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)     # Key投影
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)     # Value投影
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)     # 输出投影
+        
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
