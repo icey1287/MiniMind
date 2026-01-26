@@ -1,5 +1,10 @@
+from typing import Tuple
 from transformers import Optional, PretrainedConfig
-
+import torch
+import torch.nn as nn
+import math
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -71,9 +76,6 @@ class MiniMindConfig(PretrainedConfig):
             else None
         )
 
-import torch
-import torch.nn as nn
-import math
 
 class RMSNorm(nn.Module):
 
@@ -122,7 +124,7 @@ def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
         
         return x[:, :, :, None, :].expand(bs,slen,n_key_value_heads,n_rep,head_dim).reshape(bs,slen,n_key_value_heads*n_rep,head_dim)
 
-class Attention(nn.Module):
+class Attention(nn.Module):     #GQA
     def __init__(self,args:MiniMindConfig):
         super().__init__()
 
@@ -144,3 +146,63 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+
+    def forward(self,x:torch.Tensor,
+                position_embeddings:Tuple[torch.Tensor,torch.Tensor],
+                past_key_value:Optional[Tuple[torch.Tensor,torch.Tensor]]=None,
+                use_cache=False,
+                attention_mask:Optional[torch.Tensor]=None)->torch.Tensor:
+        bsz,seq_len,_=x.shape
+
+        xq,xk,xv=self.q_proj(x),self.k_proj(x),self.v_proj(x)
+
+        xq=xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
+        xk=xk.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+        xv=xv.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+
+        cos,sin=position_embeddings
+
+        xq,xk=apply_rotary_pos_emb(xq,xk,cos,sin)
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+        xq=xq.transpose(1,2)  # bsz, n_local_heads, seq_len, head_dim
+        xk=repeat_kv(xk,self.n_rep).transpose(1,2)  # bsz, n_local_heads, seq_len, head_dim
+        xv=repeat_kv(xv,self.n_rep).transpose(1,2)  # bsz, n_local_heads, seq_len, head_dim
+
+        if self.flash and seq_len>1 and (attention_mask is None or torch.all(attention_mask == 1)):
+            output=F.scaled_dot_product_attention(xq,xk,xv,dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores=(xq@xk.transpose(-2,-1))/math.sqrt(self.head_dim)
+            scores[:,:,:,-seq_len:]+=torch.triu(torch.full((seq_len,seq_len),float('-inf'),device=scores.device),diagonal=1)
+
+            if attention_mask is not None:
+                extended_attention_mask=attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask=(1.0-extended_attention_mask)*-1e9
+                scores=scores+extended_attention_mask
+            
+            scores=F.softmax(scores.float(),dim=-1).type_as(xq)
+            scores=self.attn_dropout(scores)
+            output=scores@xv
+        
+        output=output.transpose(1,2).reshape(bsz,seq_len,-1) # bsz, seq_len, n_local_heads*head_dim
+        output=self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+
+class FeedForward(nn.Module):
+    def __init__(self,config:MiniMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size=int(config.hidden_size*8/3)
+            config.intermediate_size=64*((intermediate_size+63)//64)
+        self.gate_proj=nn.Linear(config.hidden_size,config.intermediate_size,bias=False)
+        self.down_proj=nn.Linear(config.intermediate_size,config.hidden_size,bias=False)
+        self.up_proj=nn.Linear(config.hidden_size,config.intermediate_size,bias=False)
+        self.dropout=nn.Dropout(config.dropout)
+        self.act_fn=ACT2FN(config.hidden_act)
+        
+
+    def forward(self,x):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+
