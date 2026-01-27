@@ -1,10 +1,11 @@
-from typing import Tuple
-from transformers import Optional, PretrainedConfig
+from typing import Tuple,Optional,List,Union
+from transformers import  PretrainedConfig,PreTrainedModel,GenerationMixin
 import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -92,7 +93,7 @@ class RMSNorm(nn.Module):
         return self.weight * self._norm(x.float()).type_as(x)
 
 def precompute_freqs_cis(dim:int,end:int=int(32*1024),rope_base:float=1e6,rope_scaling:Optional[dict]=None):
-    freqs=1.0/(rope_base**(torch.arange(0,dim,2)[:dim//2].float()/dim))
+    freqs,attn_factor=1.0/(rope_base**(torch.arange(0,dim,2)[:dim//2].float()/dim)),1.0
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
@@ -116,7 +117,10 @@ def apply_rotary_pos_emb(q,k,cos,sin,position_ids=None,unsqueeze_dim=1):
         x1=x[..., :x.shape[-1]//2]
         x2=x[..., x.shape[-1]//2:]
         return torch.stack((-x2,x1),dim=-1).flatten(-2)
-    
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    return q_embed, k_embed
+
 def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
         bs,slen,n_key_value_heads,head_dim=x.shape
         if n_rep==1:
@@ -145,7 +149,7 @@ class Attention(nn.Module):     #GQA
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
 
     def forward(self,x:torch.Tensor,
                 position_embeddings:Tuple[torch.Tensor,torch.Tensor],
@@ -252,7 +256,7 @@ class MiniMindModel(nn.Module):
     def forward(self,
                 input_ids:Optional[torch.Tensor]=None,
                 attention_mask:Optional[torch.Tensor]=None,
-                past_key_values:Optional[list[Tuple[torch.Tensor,torch.Tensor]]]=None,
+                past_key_values:Optional[List[Tuple[torch.Tensor,torch.Tensor]]]=None,
                 use_cache:bool=False,
                 **kwargs,                
                 ):
@@ -282,3 +286,45 @@ class MiniMindModel(nn.Module):
 
         # aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents
+
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self,config:MiniMindConfig):
+        self.config=config or MiniMindConfig()
+        super().__init__(self.config)
+        self.model=MiniMindModel(self.config)
+        self.lm_head=nn.Linear(self.config.hidden_size,self.config.vocab_size,bias=False)
+        #输出层和嵌入层权重共享
+        self.model.embed_tokens.weight=self.lm_head.weight
+
+    def forward(self,
+                input_ids:Optional[torch.Tensor]=None,
+                attention_mask:Optional[torch.Tensor]=None,
+                labels:Optional[torch.Tensor]=None,
+                past_key_values:Optional[List[Tuple[torch.Tensor,torch.Tensor]]]=None,
+                use_cache:bool=False,
+                logits_to_keep:Union[int,torch.Tensor]=0,
+                **args):
+        
+        hidden_states,past_key_values=self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        aux_loss = None
+
+        slice_indices=slice(-logits_to_keep,None) if isinstance(logits_to_keep,int)  else logits_to_keep 
+        logits=self.lm_head(hidden_states)[:,slice_indices,:]
+
+        loss=None
+        if labels is not None:
+            shifted_logits=logits[...,:-1,:].contiguous()
+            shifted_labels=labels[...,1:].contiguous()
+            loss=F.cross_entropy(shifted_logits.view(-1,shifted_logits.size(-1)),shifted_labels.view(-1),ignore_index=-100)
+
+        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        output.aux_loss = aux_loss
+        return output
