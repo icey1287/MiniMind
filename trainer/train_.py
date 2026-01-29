@@ -19,19 +19,20 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
-    for step, (input_ids, labels) in enumerate(loader,start=start_step+1):
-        input_ids=input_ids.to(args.device)
-        labels=labels.to(args.device)
-        lr=get_lr(epoch*iters+step,args.epochs*iters,args.learning_rate)
+    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
-            param_group['lr']=lr
-        
+            param_group['lr'] = lr
+
         with autocast_ctx:
-            res=model(input_ids,labels=labels)
-            loss=res.loss+res.aux_loss
-            loss=loss/args.accumulation_steps
+            res = model(input_ids, labels=labels)
+            loss = res.loss + res.aux_loss
+            loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -67,6 +68,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             del state_dict
 
         del input_ids, labels, res, loss
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
@@ -125,7 +127,7 @@ if __name__ == "__main__":
         Logger('torch.compile enabled')
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    scaler = torch.cuda.amp.GradScaler(cuda_enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
